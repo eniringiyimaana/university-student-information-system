@@ -119,7 +119,7 @@ Set-Acl "$root\Grades" $acl
 
 # Show the setting of each audit subcategory we turned on
 foreach ($s in 'Logon','Account Lockout','User Account Management','Security Group Management','File System') {
-    auditpol /get /subcategory:"$s" | Select-String -Pattern 'Success|Failure|No Auditing'
+    auditpol /get /subcategory:"$s" | Select-String -Pattern 'Success|Failure|No Auditing' | Out-Host
 }
 
 # ---------------------------------------------------------------
@@ -151,13 +151,13 @@ Write-Host "(Expected: Student DENIED, Lecturer ALLOWED, IT admin DENIED, Moodle
 
 Step "5b. Lockout test: 5 wrong passwords lock the student account"
 1..6 | ForEach-Object { cmd /c "net use \\localhost\IPC$ /user:SIS_Student1 WrongPassword!$_ 2>nul" | Out-Null }
-net user SIS_Student1 | Select-String 'Account active','Lockout','locked'
-Get-LocalUser SIS_Student1 | Select-Object Name, Enabled
+net user SIS_Student1 | Select-String 'Account active','Lockout','locked' | Out-Host
+Get-LocalUser SIS_Student1 | Select-Object Name, Enabled | Out-Host
 
 Step "5c. Recent security events"
 # 4625 failed logon, 4740 account locked, 4720 account created, 4732 added to group
 Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625,4740,4720,4732} -MaxEvents 15 -ErrorAction SilentlyContinue |
-    Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap
+    Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap | Out-Host
 
 # ---------------------------------------------------------------
 # 6. Recovery commands (shown, with the unlock actually run)
