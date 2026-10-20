@@ -1,172 +1,118 @@
-<#
-  sis_auth_setup.ps1
-  Implements the SIS authentication design on a Windows machine (PowerShell).
-  Run as Administrator, on a VM or a CI runner, NOT on your everyday computer.
+@echo off
+REM ====================================================================
+REM  sis_auth_setup.bat
+REM  Implements the SIS authentication design from Command Prompt.
+REM  Run from an elevated (Administrator) Command Prompt, on a VM or CI runner.
+REM
+REM  Usage:   sis_auth_setup.bat                 (random test password)
+REM           sis_auth_setup.bat MyThrowaway!Pw1 (your own throwaway password)
+REM
+REM  Local Windows accounts cannot do MFA. In a real deployment it comes from
+REM  an identity provider such as Microsoft Entra ID Conditional Access, with
+REM  FIDO2 hardware keys for administrators.
+REM ====================================================================
+REM Plain setlocal: delayed expansion would strip "!" characters from passwords.
+setlocal
 
-  Usage:
-    ./sis_auth_setup.ps1                       # random test passwords are generated
-    ./sis_auth_setup.ps1 -TestPassword 'Xx...' # or supply your own throwaway password
-
-  Passwords are never printed or stored in this file.
-  Note: local Windows accounts cannot do MFA. In a real deployment MFA would come from
-  an identity provider such as Microsoft Entra ID Conditional Access, with FIDO2
-  hardware keys for administrators.
-#>
-param(
-    [string]$TestPassword
+REM --- 0. Must be Administrator ---
+net session >nul 2>&1
+if errorlevel 1 (
+    echo Run this script as Administrator.
+    exit /b 1
 )
 
-$ErrorActionPreference = 'Continue'
+REM --- Test password: argument 1, or a random one that meets complexity rules ---
+REM Random password is 13 characters: Windows asks a Y/N question for passwords
+REM longer than 14, which cannot be answered in an unattended run.
+set "PWD=%~1"
+if not "%PWD%"=="" goto :havepwd
+set "R=00000%RANDOM%"
+set "PWD=Sis!Zq9x%R:~-5%"
+:havepwd
 
-function Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
+echo.
+echo === 1. Create role groups and sample accounts ===
+for %%G in (SIS_Students SIS_Lecturers SIS_Admins SIS_Integrations) do (
+    net localgroup %%G >nul 2>&1 || net localgroup %%G /add /comment:"SIS role" >nul
+)
+call :makeuser SIS_Student1  SIS_Students
+call :makeuser SIS_Lecturer1 SIS_Lecturers
+call :makeuser SIS_ITAdmin1  SIS_Admins
+call :makeuser SIS_Moodle    SIS_Integrations
+net localgroup SIS_Students
+net localgroup SIS_Lecturers
 
-# ---------------------------------------------------------------
-# 0. Check we are running as Administrator
-# ---------------------------------------------------------------
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { Write-Host "Run this script as Administrator." -ForegroundColor Red; exit 1 }
+echo.
+echo === 2. Password and lockout policy ===
+REM 12-character minimum, lock after 5 bad attempts for 15 minutes
+net accounts /minpwlen:12 /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 >nul
 
-# If no password was given, build a random one that meets the complexity rules
-if (-not $TestPassword) {
-    $TestPassword = 'Sis!' + (-join ((48..57 + 65..90 + 97..122) | Get-Random -Count 12 | ForEach-Object { [char]$_ })) + 'a9'
-}
-$SecurePwd = ConvertTo-SecureString $TestPassword -AsPlainText -Force
-
-# ---------------------------------------------------------------
-# 1. Roles (local groups) and one sample account per role
-# ---------------------------------------------------------------
-Step "1. Create role groups and sample accounts"
-
-$roles = @{
-    'SIS_Students'     = 'SIS_Student1'
-    'SIS_Lecturers'    = 'SIS_Lecturer1'
-    'SIS_Admins'       = 'SIS_ITAdmin1'
-    'SIS_Integrations' = 'SIS_Moodle'
-}
-
-foreach ($group in $roles.Keys) {
-    if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
-        New-LocalGroup -Name $group -Description "SIS role: $group" | Out-Null
-    }
-    $user = $roles[$group]
-    if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-        New-LocalUser -Name $user -Password $SecurePwd -Description "Sample $group account" `
-            -PasswordNeverExpires | Out-Null
-    }
-    Add-LocalGroupMember -Group $group -Member $user -ErrorAction SilentlyContinue
-}
-Get-LocalGroup -Name 'SIS_*' | Select-Object Name, Description | Format-Table -AutoSize
-Get-LocalUser  -Name 'SIS_*' | Select-Object Name, Enabled | Format-Table -AutoSize
-
-# ---------------------------------------------------------------
-# 2. Password and lockout policy
-# ---------------------------------------------------------------
-Step "2. Password and lockout policy"
-
-net accounts /minpwlen:12 /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
-
-# Turn on password complexity (not available through 'net accounts', so use secedit)
-$cfg = "$env:TEMP\secpol.cfg"
-secedit /export /cfg $cfg /quiet
-(Get-Content $cfg) -replace 'PasswordComplexity\s*=\s*\d', 'PasswordComplexity = 1' | Set-Content $cfg
-secedit /configure /db "$env:TEMP\secpol.sdb" /cfg $cfg /areas SECURITYPOLICY /quiet
-Remove-Item $cfg -ErrorAction SilentlyContinue
-
+REM Turn on password complexity with secedit
+secedit /export /cfg "%TEMP%\secpol.cfg" /quiet
+powershell -NoProfile -Command "(Get-Content '%TEMP%\secpol.cfg') -replace 'PasswordComplexity\s*=\s*\d','PasswordComplexity = 1' | Set-Content '%TEMP%\secpol.cfg'"
+secedit /configure /db "%TEMP%\secpol.sdb" /cfg "%TEMP%\secpol.cfg" /areas SECURITYPOLICY /quiet
+del "%TEMP%\secpol.cfg" >nul 2>&1
 net accounts
 
-# ---------------------------------------------------------------
-# 3. Role permissions on folders (authorization / least privilege)
-# ---------------------------------------------------------------
-Step "3. Folder permissions per role"
+echo.
+echo === 3. Folder permissions per role ===
+for %%F in (Results Grades Enrollment) do (
+    if not exist "C:\SIS\%%F" mkdir "C:\SIS\%%F"
+    REM remove inherited permissions, keep SYSTEM and Administrators only
+    icacls "C:\SIS\%%F" /inheritance:r >nul
+    icacls "C:\SIS\%%F" /grant "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" >nul
+)
+REM Results: students read only, lecturers can change
+icacls "C:\SIS\Results"    /grant "SIS_Students:(OI)(CI)R" "SIS_Lecturers:(OI)(CI)M" >nul
+REM Grades: lecturers can change, IT admins read only, students none
+icacls "C:\SIS\Grades"     /grant "SIS_Lecturers:(OI)(CI)M" "SIS_Admins:(OI)(CI)R" >nul
+REM Enrollment: integrations read only, lecturers read
+icacls "C:\SIS\Enrollment" /grant "SIS_Integrations:(OI)(CI)R" "SIS_Lecturers:(OI)(CI)R" >nul
+for %%F in (Results Grades Enrollment) do (
+    echo.
+    echo C:\SIS\%%F
+    icacls "C:\SIS\%%F"
+)
 
-$root = 'C:\SIS'
-$folders = 'Results','Grades','Enrollment'
-foreach ($f in $folders) { New-Item -ItemType Directory -Path "$root\$f" -Force | Out-Null }
+echo.
+echo === 4. Audit logging ===
+auditpol /set /subcategory:"Logon"                     /success:enable /failure:enable >nul
+auditpol /set /subcategory:"Account Lockout"           /success:enable /failure:enable >nul
+auditpol /set /subcategory:"User Account Management"   /success:enable /failure:enable >nul
+auditpol /set /subcategory:"Security Group Management" /success:enable /failure:enable >nul
+auditpol /set /subcategory:"File System"               /success:enable /failure:enable >nul
+REM Audit every write/delete in the Grades folder (file auditing rule via PowerShell)
+powershell -NoProfile -Command "$a=Get-Acl 'C:\SIS\Grades'; $r=New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone','Write,Delete,ChangePermissions','ContainerInherit,ObjectInherit','None','Success,Failure'); $a.AddAuditRule($r); Set-Acl 'C:\SIS\Grades' $a"
+auditpol /get /subcategory:"Logon","Account Lockout","User Account Management","Security Group Management","File System"
 
-# Start clean: remove inherited permissions, keep only SYSTEM and Administrators
-foreach ($f in $folders) {
-    icacls "$root\$f" /inheritance:r | Out-Null
-    icacls "$root\$f" /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
-}
+echo.
+echo === 5. Lockout test: wrong passwords lock the student account ===
+for /L %%I in (1,1,6) do net use \\localhost\IPC$ /user:SIS_Student1 WrongPassword!%%I >nul 2>&1
+net user SIS_Student1 | findstr /i "active locked lockout"
 
-# Results: students READ only, lecturers can change
-icacls "$root\Results"    /grant 'SIS_Students:(OI)(CI)R'  'SIS_Lecturers:(OI)(CI)M' | Out-Null
-# Grades: lecturers can change, IT admins READ only, students no access
-icacls "$root\Grades"     /grant 'SIS_Lecturers:(OI)(CI)M' 'SIS_Admins:(OI)(CI)R'    | Out-Null
-# Enrollment: integrations READ only (e.g. library checks enrolment), lecturers read
-icacls "$root\Enrollment" /grant 'SIS_Integrations:(OI)(CI)R' 'SIS_Lecturers:(OI)(CI)R' | Out-Null
+echo.
+echo === 5b. Recent security events (failed logon 4625, lockout 4740, account created 4720) ===
+REM One short line per event (the full text format prints about 40 lines each)
+powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625,4740,4720,4732} -MaxEvents 15 | Select-Object TimeCreated, Id, @{n='Message';e={$_.Message.Split([char]10)[0]}} | Format-Table -AutoSize -Wrap"
 
-foreach ($f in $folders) { Write-Host "`n$root\$f"; icacls "$root\$f" }
-
-# ---------------------------------------------------------------
-# 4. Logging (auditing)
-# ---------------------------------------------------------------
-Step "4. Turn on audit logging"
-
-auditpol /set /subcategory:"Logon"                    /success:enable /failure:enable | Out-Null
-auditpol /set /subcategory:"Account Lockout"          /success:enable /failure:enable | Out-Null
-auditpol /set /subcategory:"User Account Management"  /success:enable /failure:enable | Out-Null
-auditpol /set /subcategory:"Security Group Management" /success:enable /failure:enable | Out-Null
-auditpol /set /subcategory:"File System"              /success:enable /failure:enable | Out-Null
-
-# Record every write or delete in the Grades folder (who changed what, and when)
-$acl  = Get-Acl "$root\Grades"
-$rule = New-Object System.Security.AccessControl.FileSystemAuditRule(
-    'Everyone', 'Write,Delete,ChangePermissions', 'ContainerInherit,ObjectInherit', 'None', 'Success,Failure')
-$acl.AddAuditRule($rule)
-Set-Acl "$root\Grades" $acl
-
-auditpol /get /category:"Logon/Logoff","Account Management","Object Access" | Select-Object -First 25
-
-# ---------------------------------------------------------------
-# 5. Prove the controls work
-# ---------------------------------------------------------------
-Step "5a. Authorization test: can each role write to the Grades folder?"
-
-# Checks the folder's access list to see whether a role's group can write.
-# (Logging in as each test user would hang on a CI runner, so we read the
-#  permissions that Windows will enforce instead. The result is the same.)
-function Test-Write($user, $group, $folder) {
-    $writeRights = [System.Security.AccessControl.FileSystemRights]'WriteData,AppendData,Modify,FullControl'
-    $allowed = $false
-    foreach ($rule in (Get-Acl $folder).Access) {
-        if ($rule.IdentityReference.Value -like "*\$group" -and
-            $rule.AccessControlType -eq 'Allow' -and
-            ($rule.FileSystemRights -band $writeRights)) { $allowed = $true }
-    }
-    $r = if ($allowed) { 'ALLOWED' } else { 'DENIED' }
-    Write-Host ("{0,-15} ({1,-16}) write to Grades: {2}" -f $user, $group, $r)
-}
-Test-Write 'SIS_Student1'  'SIS_Students'     "$root\Grades"
-Test-Write 'SIS_Lecturer1' 'SIS_Lecturers'    "$root\Grades"
-Test-Write 'SIS_ITAdmin1'  'SIS_Admins'       "$root\Grades"
-Test-Write 'SIS_Moodle'    'SIS_Integrations' "$root\Grades"
-Write-Host "(Expected: Student DENIED, Lecturer ALLOWED, IT admin DENIED, Moodle DENIED)"
-
-Step "5b. Lockout test: 5 wrong passwords lock the student account"
-1..6 | ForEach-Object { cmd /c "net use \\localhost\IPC$ /user:SIS_Student1 WrongPassword!$_ 2>nul" | Out-Null }
-net user SIS_Student1 | Select-String 'Account active','Lockout','locked'
-Get-LocalUser SIS_Student1 | Select-Object Name, Enabled
-
-Step "5c. Recent security events"
-# 4625 failed logon, 4740 account locked, 4720 account created, 4732 added to group
-Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625,4740,4720,4732} -MaxEvents 15 -ErrorAction SilentlyContinue |
-    Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap
-
-# ---------------------------------------------------------------
-# 6. Recovery commands (shown, with the unlock actually run)
-# ---------------------------------------------------------------
-Step "6. Recovery"
-Write-Host "Unlock the locked student account:"
+echo.
+echo === 6. Recovery ===
+echo Unlocking the student account:
 net user SIS_Student1 /active:yes
-Write-Host "`nOther recovery commands you can run on a real system:"
-Write-Host "  Reset password : Set-LocalUser -Name SIS_Student1 -Password (Read-Host -AsSecureString)"
-Write-Host "  Disable account: Disable-LocalUser -Name SIS_Moodle      # revoke an integration"
-Write-Host "  Enable account : Enable-LocalUser  -Name SIS_Moodle"
+echo.
+echo Other recovery commands:
+echo   Reset password : net user SIS_Student1 NewThrowawayPw!1
+echo   Disable account: net user SIS_Moodle /active:no     (revoke an integration)
+echo   Enable account : net user SIS_Moodle /active:yes
 
-Step "MFA note"
-Write-Host "Local Windows accounts cannot do MFA. In a real deployment it comes from an identity provider"
-Write-Host "such as Microsoft Entra ID Conditional Access, with FIDO2 hardware keys for administrators."
+echo.
+echo Done.
+endlocal
+exit /b 0
 
-Write-Host "`nDone." -ForegroundColor Green
+REM --- helper: create a user if missing, then add to a group ---
+:makeuser
+REM "echo y|" answers the long-password question if a longer password was supplied
+net user %1 >nul 2>&1 || (echo y| net user %1 "%PWD%" /add /passwordchg:no /expires:never >nul)
+net localgroup %2 %1 /add >nul 2>&1
+exit /b 0
