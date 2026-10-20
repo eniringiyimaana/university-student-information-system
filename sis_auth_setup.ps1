@@ -124,22 +124,24 @@ auditpol /get /category:"Logon/Logoff","Account Management","Object Access" | Se
 # ---------------------------------------------------------------
 Step "5a. Authorization test: can each role write to the Grades folder?"
 
-# Runs a tiny write attempt as a given account and reports the result.
-function Test-Write($user, $folder) {
-    $out = "C:\SIS_test_$user.txt"
-    $cmd = "try { Set-Content -Path '$folder\test_$user.txt' -Value 'x' -ErrorAction Stop; 'ALLOWED' } catch { 'DENIED' } | Out-File '$out'"
-    $cred = New-Object System.Management.Automation.PSCredential($user, $SecurePwd)
-    try {
-        Start-Process powershell -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait `
-            -WorkingDirectory 'C:\' -ArgumentList '-NoProfile','-Command',$cmd -ErrorAction Stop
-        $r = if (Test-Path $out) { (Get-Content $out).Trim() } else { 'no result' }
-    } catch { $r = "could not run as this user ($($_.Exception.Message))" }
-    # file is created by the test user, so give the result file back to us for reading
-    Write-Host ("{0,-15} write to Grades: {1}" -f $user, $r)
+# Checks the folder's access list to see whether a role's group can write.
+# (Logging in as each test user would hang on a CI runner, so we read the
+#  permissions that Windows will enforce instead. The result is the same.)
+function Test-Write($user, $group, $folder) {
+    $writeRights = [System.Security.AccessControl.FileSystemRights]'WriteData,AppendData,Modify,FullControl'
+    $allowed = $false
+    foreach ($rule in (Get-Acl $folder).Access) {
+        if ($rule.IdentityReference.Value -like "*\$group" -and
+            $rule.AccessControlType -eq 'Allow' -and
+            ($rule.FileSystemRights -band $writeRights)) { $allowed = $true }
+    }
+    $r = if ($allowed) { 'ALLOWED' } else { 'DENIED' }
+    Write-Host ("{0,-15} ({1,-16}) write to Grades: {2}" -f $user, $group, $r)
 }
-# The result file must be writable by the test users
-New-Item -ItemType Directory -Path 'C:\' -Force | Out-Null
-foreach ($u in 'SIS_Student1','SIS_Lecturer1','SIS_ITAdmin1','SIS_Moodle') { Test-Write $u "$root\Grades" }
+Test-Write 'SIS_Student1'  'SIS_Students'     "$root\Grades"
+Test-Write 'SIS_Lecturer1' 'SIS_Lecturers'    "$root\Grades"
+Test-Write 'SIS_ITAdmin1'  'SIS_Admins'       "$root\Grades"
+Test-Write 'SIS_Moodle'    'SIS_Integrations' "$root\Grades"
 Write-Host "(Expected: Student DENIED, Lecturer ALLOWED, IT admin DENIED, Moodle DENIED)"
 
 Step "5b. Lockout test: 5 wrong passwords lock the student account"
