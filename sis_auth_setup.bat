@@ -11,7 +11,8 @@ REM  Local Windows accounts cannot do MFA. In a real deployment it comes from
 REM  an identity provider such as Microsoft Entra ID Conditional Access, with
 REM  FIDO2 hardware keys for administrators.
 REM ====================================================================
-setlocal EnableDelayedExpansion
+REM Plain setlocal: delayed expansion would strip "!" characters from passwords.
+setlocal
 
 REM --- 0. Must be Administrator ---
 net session >nul 2>&1
@@ -21,8 +22,13 @@ if errorlevel 1 (
 )
 
 REM --- Test password: argument 1, or a random one that meets complexity rules ---
+REM Random password is 13 characters: Windows asks a Y/N question for passwords
+REM longer than 14, which cannot be answered in an unattended run.
 set "PWD=%~1"
-if "%PWD%"=="" set "PWD=Sis!%RANDOM%%RANDOM%aB9x"
+if not "%PWD%"=="" goto :havepwd
+set "R=00000%RANDOM%"
+set "PWD=Sis!Zq9x%R:~-5%"
+:havepwd
 
 echo.
 echo === 1. Create role groups and sample accounts ===
@@ -77,7 +83,7 @@ auditpol /set /subcategory:"Security Group Management" /success:enable /failure:
 auditpol /set /subcategory:"File System"               /success:enable /failure:enable >nul
 REM Audit every write/delete in the Grades folder (file auditing rule via PowerShell)
 powershell -NoProfile -Command "$a=Get-Acl 'C:\SIS\Grades'; $r=New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone','Write,Delete,ChangePermissions','ContainerInherit,ObjectInherit','None','Success,Failure'); $a.AddAuditRule($r); Set-Acl 'C:\SIS\Grades' $a"
-auditpol /get /subcategory:"Logon","Account Lockout","User Account Management","File System"
+auditpol /get /subcategory:"Logon","Account Lockout","User Account Management","Security Group Management","File System"
 
 echo.
 echo === 5. Lockout test: wrong passwords lock the student account ===
@@ -86,7 +92,8 @@ net user SIS_Student1 | findstr /i "active locked lockout"
 
 echo.
 echo === 5b. Recent security events (failed logon 4625, lockout 4740, account created 4720) ===
-wevtutil qe Security /q:"*[System[(EventID=4625 or EventID=4740 or EventID=4720)]]" /c:10 /rd:true /f:text | more
+REM One short line per event (the full text format prints about 40 lines each)
+powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625,4740,4720,4732} -MaxEvents 15 | Select-Object TimeCreated, Id, @{n='Message';e={$_.Message.Split([char]10)[0]}} | Format-Table -AutoSize -Wrap"
 
 echo.
 echo === 6. Recovery ===
@@ -105,6 +112,7 @@ exit /b 0
 
 REM --- helper: create a user if missing, then add to a group ---
 :makeuser
-net user %1 >nul 2>&1 || net user %1 "%PWD%" /add /passwordchg:no /expires:never >nul
+REM "echo y|" answers the long-password question if a longer password was supplied
+net user %1 >nul 2>&1 || (echo y| net user %1 "%PWD%" /add /passwordchg:no /expires:never >nul)
 net localgroup %2 %1 /add >nul 2>&1
 exit /b 0
