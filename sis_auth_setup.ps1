@@ -1,142 +1,170 @@
-#Requires -RunAsAdministrator
 <#
-  University Student Information System - authentication design demo (PowerShell)
-  Run in an elevated PowerShell window on a TEST machine or VM, not on your daily PC.
-  Usage:  powershell -ExecutionPolicy Bypass -File .\sis_auth_setup.ps1
-#>
+  sis_auth_setup.ps1
+  Implements the SIS authentication design on a Windows machine (PowerShell).
+  Run as Administrator, on a VM or a CI runner, NOT on your everyday computer.
 
-$root = 'C:\SIS'
+  Usage:
+    ./sis_auth_setup.ps1                       # random test passwords are generated
+    ./sis_auth_setup.ps1 -TestPassword 'Xx...' # or supply your own throwaway password
+
+  Passwords are never printed or stored in this file.
+  Note: local Windows accounts cannot do MFA. In a real deployment MFA would come from
+  an identity provider such as Microsoft Entra ID Conditional Access, with FIDO2
+  hardware keys for administrators.
+#>
+param(
+    [string]$TestPassword
+)
+
+$ErrorActionPreference = 'Continue'
 
 function Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 
-# 1. Users and roles --------------------------------------------------------
-Step '1. Create role groups and sample accounts'
+# ---------------------------------------------------------------
+# 0. Check we are running as Administrator
+# ---------------------------------------------------------------
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { Write-Host "Run this script as Administrator." -ForegroundColor Red; exit 1 }
 
-$groups = 'SIS_Students', 'SIS_Lecturers', 'SIS_Admins', 'SIS_Integrations'
-foreach ($g in $groups) {
-    if (-not (Get-LocalGroup -Name $g -ErrorAction SilentlyContinue)) {
-        New-LocalGroup -Name $g -Description "SIS role: $g" | Out-Null
-    }
+# If no password was given, build a random one that meets the complexity rules
+if (-not $TestPassword) {
+    $TestPassword = 'Sis!' + (-join ((48..57 + 65..90 + 97..122) | Get-Random -Count 12 | ForEach-Object { [char]$_ })) + 'a9'
+}
+$SecurePwd = ConvertTo-SecureString $TestPassword -AsPlainText -Force
+
+# ---------------------------------------------------------------
+# 1. Roles (local groups) and one sample account per role
+# ---------------------------------------------------------------
+Step "1. Create role groups and sample accounts"
+
+$roles = @{
+    'SIS_Students'     = 'SIS_Student1'
+    'SIS_Lecturers'    = 'SIS_Lecturer1'
+    'SIS_Admins'       = 'SIS_ITAdmin1'
+    'SIS_Integrations' = 'SIS_Moodle'
 }
 
-$accounts = @(
-    @{ Name = 'student01';   Group = 'SIS_Students' },
-    @{ Name = 'lecturer01';  Group = 'SIS_Lecturers' },
-    @{ Name = 'admin01';     Group = 'SIS_Admins' },
-    @{ Name = 'svc_library'; Group = 'SIS_Integrations' }
-)
-foreach ($a in $accounts) {
-    if (-not (Get-LocalUser -Name $a.Name -ErrorAction SilentlyContinue)) {
-        $pw = Read-Host -Prompt "Set a password for $($a.Name) (12+ characters)" -AsSecureString
-        New-LocalUser -Name $a.Name -Password $pw -Description "SIS $($a.Group)" | Out-Null
+foreach ($group in $roles.Keys) {
+    if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
+        New-LocalGroup -Name $group -Description "SIS role: $group" | Out-Null
     }
-    Add-LocalGroupMember -Group $a.Group -Member $a.Name -ErrorAction SilentlyContinue
+    $user = $roles[$group]
+    if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+        New-LocalUser -Name $user -Password $SecurePwd -Description "Sample $group account" `
+            -PasswordNeverExpires | Out-Null
+    }
+    Add-LocalGroupMember -Group $group -Member $user -ErrorAction SilentlyContinue
 }
+Get-LocalGroup -Name 'SIS_*' | Select-Object Name, Description | Format-Table -AutoSize
+Get-LocalUser  -Name 'SIS_*' | Select-Object Name, Enabled | Format-Table -AutoSize
 
-# 2. Password policy and lockout -------------------------------------------
-Step '2. Password policy and account lockout'
+# ---------------------------------------------------------------
+# 2. Password and lockout policy
+# ---------------------------------------------------------------
+Step "2. Password and lockout policy"
 
-net accounts /minpwlen:12 /maxpwage:90 /minpwage:1 /uniquepw:5 | Out-Null
-net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
+net accounts /minpwlen:12 /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
 
-# Turn on password complexity (not available through "net accounts")
-$cfg = Join-Path $env:TEMP 'sis_sec.cfg'
-secedit /export /cfg $cfg | Out-Null
-(Get-Content $cfg) -replace 'PasswordComplexity\s*=\s*0', 'PasswordComplexity = 1' | Set-Content $cfg
-secedit /configure /db "$env:windir\security\local.sdb" /cfg $cfg /areas SECURITYPOLICY | Out-Null
+# Turn on password complexity (not available through 'net accounts', so use secedit)
+$cfg = "$env:TEMP\secpol.cfg"
+secedit /export /cfg $cfg /quiet
+(Get-Content $cfg) -replace 'PasswordComplexity\s*=\s*\d', 'PasswordComplexity = 1' | Set-Content $cfg
+secedit /configure /db "$env:TEMP\secpol.sdb" /cfg $cfg /areas SECURITYPOLICY /quiet
 Remove-Item $cfg -ErrorAction SilentlyContinue
+
 net accounts
 
-# 3. MFA ----------------------------------------------------------------------
-Step '3. MFA (see note)'
-Write-Host @'
-Local Windows accounts cannot do MFA on their own. In a real deployment MFA is
-enforced by the identity provider:
-  - Microsoft Entra ID Conditional Access: require MFA for lecturers, admins,
-    any off-campus sign-in, and sensitive actions for students.
-  - Admins: FIDO2 security keys or smart cards.
-On an Active Directory domain, the admin smart card rule would be:
-  Set-ADUser -Identity admin01 -SmartcardLogonRequired $true
-'@
+# ---------------------------------------------------------------
+# 3. Role permissions on folders (authorization / least privilege)
+# ---------------------------------------------------------------
+Step "3. Folder permissions per role"
 
-# 4. Authorization by role (folder permissions) -----------------------------
-Step '4. Role-based folder permissions'
+$root = 'C:\SIS'
+$folders = 'Results','Grades','Enrollment'
+foreach ($f in $folders) { New-Item -ItemType Directory -Path "$root\$f" -Force | Out-Null }
 
-$folders = 'Results', 'Grades', 'Finance', 'Enrollment', 'AuditExports'
-foreach ($f in $folders) { New-Item -Path "$root\$f" -ItemType Directory -Force | Out-Null }
-
-# Students: read results only. Lecturers: read results, change grades.
-# Admins (IT): manage results, read-only on grades. Integrations: enrollment only.
-icacls "$root\Results" /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'SIS_Admins:(OI)(CI)M' 'SIS_Lecturers:(OI)(CI)RX' 'SIS_Students:(OI)(CI)RX' | Out-Null
-icacls "$root\Grades" /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'SIS_Lecturers:(OI)(CI)M' 'SIS_Admins:(OI)(CI)RX' | Out-Null
-icacls "$root\Finance" /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'SIS_Admins:(OI)(CI)M' | Out-Null
-icacls "$root\Enrollment" /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'SIS_Admins:(OI)(CI)M' 'SIS_Integrations:(OI)(CI)RX' | Out-Null
-icacls "$root\AuditExports" /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
-icacls "$root\Grades"
-
-# 5. Logging -------------------------------------------------------------------
-Step '5. Audit logging'
-
-$subcats = 'Logon', 'Logoff', 'Account Lockout', 'User Account Management',
-           'Security Group Management', 'File System'
-foreach ($s in $subcats) {
-    auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null
+# Start clean: remove inherited permissions, keep only SYSTEM and Administrators
+foreach ($f in $folders) {
+    icacls "$root\$f" /inheritance:r | Out-Null
+    icacls "$root\$f" /grant 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
 }
 
-# Record every change to the grades folder (who changed what, and when)
+# Results: students READ only, lecturers can change
+icacls "$root\Results"    /grant 'SIS_Students:(OI)(CI)R'  'SIS_Lecturers:(OI)(CI)M' | Out-Null
+# Grades: lecturers can change, IT admins READ only, students no access
+icacls "$root\Grades"     /grant 'SIS_Lecturers:(OI)(CI)M' 'SIS_Admins:(OI)(CI)R'    | Out-Null
+# Enrollment: integrations READ only (e.g. library checks enrolment), lecturers read
+icacls "$root\Enrollment" /grant 'SIS_Integrations:(OI)(CI)R' 'SIS_Lecturers:(OI)(CI)R' | Out-Null
+
+foreach ($f in $folders) { Write-Host "`n$root\$f"; icacls "$root\$f" }
+
+# ---------------------------------------------------------------
+# 4. Logging (auditing)
+# ---------------------------------------------------------------
+Step "4. Turn on audit logging"
+
+auditpol /set /subcategory:"Logon"                    /success:enable /failure:enable | Out-Null
+auditpol /set /subcategory:"Account Lockout"          /success:enable /failure:enable | Out-Null
+auditpol /set /subcategory:"User Account Management"  /success:enable /failure:enable | Out-Null
+auditpol /set /subcategory:"Security Group Management" /success:enable /failure:enable | Out-Null
+auditpol /set /subcategory:"File System"              /success:enable /failure:enable | Out-Null
+
+# Record every write or delete in the Grades folder (who changed what, and when)
 $acl  = Get-Acl "$root\Grades"
 $rule = New-Object System.Security.AccessControl.FileSystemAuditRule(
-    'Everyone', 'Modify,Delete', 'ContainerInherit,ObjectInherit', 'None', 'Success,Failure')
+    'Everyone', 'Write,Delete,ChangePermissions', 'ContainerInherit,ObjectInherit', 'None', 'Success,Failure')
 $acl.AddAuditRule($rule)
-Set-Acl -Path "$root\Grades" -AclObject $acl
+Set-Acl "$root\Grades" $acl
 
-# Bigger security log so entries are kept longer (200 MB)
-wevtutil sl Security /ms:209715200
-auditpol /get /category:'Logon/Logoff','Account Management','Object Access' | Out-Null
+auditpol /get /category:"Logon/Logoff","Account Management","Object Access" | Select-Object -First 25
 
-# 6. Recovery helpers ----------------------------------------------------------
-Step '6. Recovery functions'
+# ---------------------------------------------------------------
+# 5. Prove the controls work
+# ---------------------------------------------------------------
+Step "5a. Authorization test: can each role write to the Grades folder?"
 
-function Reset-SisPassword {
-    param([Parameter(Mandatory)][string]$User)
-    # Run only after the person has verified their identity (ID at the help desk).
-    $pw = Read-Host -Prompt "New temporary password for $User" -AsSecureString
-    Set-LocalUser -Name $User -Password $pw
-    net user $User /logonpasswordchg:yes | Out-Null
-    Write-Host "$User must change this password at next sign-in." -ForegroundColor Green
+# Runs a tiny write attempt as a given account and reports the result.
+function Test-Write($user, $folder) {
+    $out = "C:\SIS_test_$user.txt"
+    $cmd = "try { Set-Content -Path '$folder\test_$user.txt' -Value 'x' -ErrorAction Stop; 'ALLOWED' } catch { 'DENIED' } | Out-File '$out'"
+    $cred = New-Object System.Management.Automation.PSCredential($user, $SecurePwd)
+    try {
+        Start-Process powershell -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait `
+            -WorkingDirectory 'C:\' -ArgumentList '-NoProfile','-Command',$cmd -ErrorAction Stop
+        $r = if (Test-Path $out) { (Get-Content $out).Trim() } else { 'no result' }
+    } catch { $r = "could not run as this user ($($_.Exception.Message))" }
+    # file is created by the test user, so give the result file back to us for reading
+    Write-Host ("{0,-15} write to Grades: {1}" -f $user, $r)
 }
+# The result file must be writable by the test users
+New-Item -ItemType Directory -Path 'C:\' -Force | Out-Null
+foreach ($u in 'SIS_Student1','SIS_Lecturer1','SIS_ITAdmin1','SIS_Moodle') { Test-Write $u "$root\Grades" }
+Write-Host "(Expected: Student DENIED, Lecturer ALLOWED, IT admin DENIED, Moodle DENIED)"
 
-function Unlock-SisAccount {
-    param([Parameter(Mandatory)][string]$User)
-    net user $User /active:yes | Out-Null
-    Write-Host "$User unlocked." -ForegroundColor Green
-}
+Step "5b. Lockout test: 5 wrong passwords lock the student account"
+1..6 | ForEach-Object { cmd /c "net use \\localhost\IPC$ /user:SIS_Student1 WrongPassword!$_ 2>nul" | Out-Null }
+net user SIS_Student1 | Select-String 'Account active','Lockout','locked'
+Get-LocalUser SIS_Student1 | Select-Object Name, Enabled
 
-function Revoke-SisIntegration {
-    param([Parameter(Mandatory)][string]$User)
-    Disable-LocalUser -Name $User
-    Write-Host "$User disabled. Reissue credentials through the system owner." -ForegroundColor Yellow
-}
+Step "5c. Recent security events"
+# 4625 failed logon, 4740 account locked, 4720 account created, 4732 added to group
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625,4740,4720,4732} -MaxEvents 15 -ErrorAction SilentlyContinue |
+    Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap
 
-Write-Host 'Available: Reset-SisPassword, Unlock-SisAccount, Revoke-SisIntegration (dot-source this script to keep them).'
+# ---------------------------------------------------------------
+# 6. Recovery commands (shown, with the unlock actually run)
+# ---------------------------------------------------------------
+Step "6. Recovery"
+Write-Host "Unlock the locked student account:"
+net user SIS_Student1 /active:yes
+Write-Host "`nOther recovery commands you can run on a real system:"
+Write-Host "  Reset password : Set-LocalUser -Name SIS_Student1 -Password (Read-Host -AsSecureString)"
+Write-Host "  Disable account: Disable-LocalUser -Name SIS_Moodle      # revoke an integration"
+Write-Host "  Enable account : Enable-LocalUser  -Name SIS_Moodle"
 
-# 7. Review the logs -----------------------------------------------------------
-function Show-SisLogs {
-    $events = @(
-        @{ Label = 'Failed sign-ins';       Id = 4625 },
-        @{ Label = 'Account lockouts';      Id = 4740 },
-        @{ Label = 'Accounts created';      Id = 4720 },
-        @{ Label = 'Password reset';        Id = 4724 },
-        @{ Label = 'Group membership added'; Id = 4732 }
-    )
-    foreach ($e in $events) {
-        Write-Host "`n--- $($e.Label) (Event $($e.Id)) ---" -ForegroundColor Cyan
-        Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = $e.Id } -MaxEvents 5 -ErrorAction SilentlyContinue |
-            Select-Object TimeCreated, Id, Message |
-            Format-List
-    }
-}
+Step "MFA note"
+Write-Host "Local Windows accounts cannot do MFA. In a real deployment it comes from an identity provider"
+Write-Host "such as Microsoft Entra ID Conditional Access, with FIDO2 hardware keys for administrators."
 
-Step 'Verification'
-Get-LocalGroupMember -Group 'SIS_Lecturers'
-Write-Host "`nSetup finished. Run Show-SisLogs to view recent security events." -ForegroundColor Green
+Write-Host "`nDone." -ForegroundColor Green
