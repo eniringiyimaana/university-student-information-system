@@ -1,1 +1,21 @@
+name: SIS authentication demo
 
+# Start it manually from the Actions tab with the "Run workflow" button
+on: workflow_dispatch
+
+jobs:
+  powershell-version:
+    runs-on: windows-latest      # a fresh Windows Server machine; the build user is an administrator
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the PowerShell script
+        shell: pwsh
+        run: ./sis_auth_setup.ps1
+
+  cmd-version:
+    runs-on: windows-latest      # separate machine, so the two scripts do not clash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Command Prompt script
+        shell: cmd
+        run: sis_auth_setup.bat
